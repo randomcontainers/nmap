@@ -1,0 +1,126 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS source
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gpgv \
+ && rm -rf /var/lib/apt/lists/*
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://nmap.org/dist/nmap-${VERSION}.tgz /src/
+ADD https://nmap.org/dist/sigs/nmap-${VERSION}.tgz.asc /src/
+# Nmap Project Signing Key, fingerprint 436D 66AB 9A79 8425 FDA0 E3F8 01AF 9F03 6B93 55D0
+COPY keys/nmap-release.gpg /tmp/nmap-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/nmap-release.gpg "nmap-${VERSION}.tgz.asc" "nmap-${VERSION}.tgz"; \
+    mkdir nmap; \
+    tar -xzf "nmap-${VERSION}.tgz" -C nmap --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | sort -u > /tmp/base-packages \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      libpcap0.8-dev \
+      libpcre2-dev \
+      libssh2-1-dev \
+      libssl-dev \
+      zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+COPY --link --from=source /src/nmap /src/nmap
+WORKDIR /src/nmap
+ARG JOBS
+ARG VERSION
+# Lua and LIBLINEAR are built from the tarball: configure accepts only Lua 5.4,
+# which the distros install under different paths. The other libraries come
+# from the distro. configure falls back to the copies in the tarball when it
+# does not find one, so the build checks the list nmap prints. Ncat's CA list
+# from 2018 is removed; Ncat then trusts the distro's CA certificates only.
+RUN set -eu; \
+    ./configure \
+      --prefix=/usr/local \
+      --with-liblinear=included \
+      --with-liblua=included \
+      --with-libpcap=yes \
+      --with-libpcre=yes \
+      --with-libssh2=yes \
+      --with-libz=yes \
+      --with-openssl=yes \
+      --without-ndiff \
+      --without-zenmap; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make -j1 install DESTDIR=/out; \
+    rm -rf /out/usr/local/share/man /out/usr/local/share/ncat; \
+    /out/usr/local/bin/nmap --version > /tmp/nmap-version; \
+    test "$(head -n 1 /tmp/nmap-version)" = "Nmap version ${VERSION} ( https://nmap.org )"; \
+    grep -qx 'Compiled without:' /tmp/nmap-version; \
+    if grep -E '^Compiled with:.* nmap-(libpcap|libpcre2|libssh2|libz)-' /tmp/nmap-version; then exit 1; fi
+
+ARG BASE_IMAGE
+# runtime-deps lists the packages that own the libraries the binaries load,
+# minus the base image's packages, plus the packages in runtime-deps.ubuntu.
+# Files compiled in under other licenses keep their notice in the first
+# comment that has a copyright line. LPeg and LuaFileSystem refer to the Lua
+# license for its text, and licenses/ holds the texts the tarball lacks.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses,target=/tmp/licenses.extra \
+    set -eu; \
+    meta=/out/usr/local/share/randomcontainers/nmap; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE "$meta/licenses/"; \
+    cp docs/licenses/BSD-simplified "$meta/licenses/"; \
+    cp libdnet-stripped/LICENSE "$meta/licenses/LICENSE.libdnet"; \
+    cp liblinear/COPYRIGHT "$meta/licenses/COPYRIGHT.liblinear"; \
+    cp docs/licenses/Lua-license.txt "$meta/licenses/LICENSE.lpeg-lfs"; \
+    awk '/^\/\*\*\*\*\*/ { c = 1 } c { print } c && /\*\*\*\*\*\/$/ { exit }' liblua/lua.h > "$meta/licenses/COPYRIGHT.lua"; \
+    grep -q 'Lua.org, PUC-Rio' "$meta/licenses/COPYRIGHT.lua"; \
+    for f in lpeg.c nse_fs.cc nse_zlib.cc; do \
+      awk '/\/\*/ { c = 1; b = "" } c { b = b $0 "\n" } c && /\*\// { c = 0; if (b ~ /[Cc]opyright/) { printf "%s", b; exit } }' \
+        "$f" > "$meta/licenses/COPYING.${f%.*}"; \
+      test -s "$meta/licenses/COPYING.${f%.*}"; \
+    done; \
+    cp /tmp/licenses.extra/* "$meta/licenses/"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://nmap.org/dist/nmap-${VERSION}.tgz" \
+      "https://nmap.org/dist/sigs/nmap-${VERSION}.tgz.asc" \
+      "https://github.com/randomcontainers/nmap/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "configure: $(sed -n 's/^  \$ \.\/configure //p' config.log)"; \
+      cat /tmp/nmap-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f -perm -u+x -print0 | xargs -0 ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | sort -u | comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/nmap/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "nmap"]
+CMD ["--help"]
