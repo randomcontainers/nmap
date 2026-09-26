@@ -1,0 +1,76 @@
+name: nmap
+title: Nmap
+summary: Discovers hosts and services on a network and scans their ports, with Ncat and Nping. Built from the signed Nmap release.
+homepage: https://nmap.org/
+license: LicenseRef-NPSL-0.95 AND BSD-2-Clause AND BSD-2-Clause-Patent AND BSD-3-Clause AND MIT
+source-release: true
+upstream:
+  source: html-index
+  url: https://nmap.org/dist/
+  # The index lists each release as nmap-<version>.tgz, with a local time and
+  # no zone, so the tarball's Last-Modified header is the release date.
+  pattern: 'href="nmap-(\d+\.\d+)\.tgz"'
+  versioning: loose
+  version: "7.991"
+  artifact:
+    url: https://nmap.org/dist/nmap-{version}.tgz
+    signature: https://nmap.org/dist/sigs/nmap-{version}.tgz.asc
+    sha256: a1b7f1d745c441d8f5518fe910c760e87924fd6d0caa59835206dd0742f44d9a
+image:
+  entrypoint: [nmap]
+  cmd: [--help]
+test:
+  - |
+    nmap --version > version.txt
+    test "$(head -n 1 version.txt)" = "Nmap version $VERSION ( https://nmap.org )"
+    grep -qx 'Compiled without:' version.txt
+    sed -n 's/^Compiled with: //p' version.txt | tr ' ' '\n' > libraries.txt
+    for lib in nmap-liblua openssl libssh2 libz libpcre2 libpcap nmap-libdnet ipv6; do
+      grep -Eq "^$lib(-|\$)" libraries.txt || { echo "not compiled with $lib" >&2; cat version.txt >&2; exit 1; }
+    done
+    test "$(ncat --version 2>&1)" = "Ncat: Version $VERSION ( https://nmap.org/ncat )"
+    nping --version > nping-version.txt
+    grep -qxF "Nping version $VERSION ( https://nmap.org/nping )" nping-version.txt
+    test -s /etc/ssl/certs/ca-certificates.crt
+    test ! -e /usr/local/share/ncat/ca-bundle.crt
+  - |
+    # A local listener that greets like an SSH server. As a non-root user, nmap
+    # falls back to a TCP connect scan and nping needs --tcp-connect.
+    ncat -l -k -c 'echo SSH-2.0-OpenSSH_9.9' 127.0.0.1 2222 &
+    i=0
+    until ncat -z 127.0.0.1 2222 2> /dev/null; do
+      i=$((i + 1))
+      [ "$i" -lt 30 ] || { echo "ncat is not listening" >&2; exit 1; }
+      sleep 1
+    done
+    nmap -n -Pn -sV -p 2222 --script banner -oN scan.txt -oX scan.xml 127.0.0.1
+    grep -Eq '^2222/tcp +open +ssh +OpenSSH 9\.9 \(protocol 2\.0\)' scan.txt
+    grep -Fq '|_banner: SSH-2.0-OpenSSH_9.9' scan.txt
+    grep -Fq '<service name="ssh" product="OpenSSH" version="9.9" extrainfo="protocol 2.0" method="probed"' scan.xml
+    nping --tcp-connect -p 2222 -c 1 127.0.0.1 > nping.txt
+    grep -Fq 'Successful connections: 1 ' nping.txt
+  - |
+    # ncat serves TLS with a temporary certificate for 127.0.0.1, and the
+    # ssl-cert script reads it through nmap's OpenSSL bindings.
+    ncat -l -k --ssl -c 'echo ok' 127.0.0.1 8443 &
+    i=0
+    until ncat -z 127.0.0.1 8443 2> /dev/null; do
+      i=$((i + 1))
+      [ "$i" -lt 30 ] || { echo "ncat is not listening" >&2; exit 1; }
+      sleep 1
+    done
+    nmap -n -Pn -p 8443 --script ssl-cert -oN tls.txt 127.0.0.1
+    grep -Eq '^8443/tcp +open ' tls.txt
+    grep -Fq '| ssl-cert: Subject: commonName=127.0.0.1' tls.txt
+    grep -Fq '| Public Key type: rsa' tls.txt
+    printf 'ping\n' | ncat --ssl 127.0.0.1 8443 > reply.txt
+    test "$(cat reply.txt)" = ok
+examples:
+  - title: Find the open ports on a host and the services behind them
+    command: docker run --rm ghcr.io/randomcontainers/nmap -sV scanme.nmap.org
+  - title: Scan a subnet and save the results as XML
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/nmap -sV -oX scan.xml 192.168.1.0/24
+  - title: Show the TLS certificate and ciphers of an HTTPS server
+    command: docker run --rm ghcr.io/randomcontainers/nmap -p 443 --script ssl-cert,ssl-enum-ciphers <host>
+  - title: Run a SYN scan with OS detection from the host's network
+    command: docker run --rm --user 0 --cap-add NET_RAW --network host ghcr.io/randomcontainers/nmap -sS -O 192.168.1.0/24
