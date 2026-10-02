@@ -10,8 +10,6 @@ This is an unofficial build, not affiliated with or endorsed by the Nmap Project
 docker run --rm ghcr.io/randomcontainers/nmap -sV scanme.nmap.org
 ```
 
-The same images can also be pulled as `randomcontainers.com/nmap`.
-
 `scanme.nmap.org` is a host the Nmap Project runs for trying Nmap out, and a few scans a day are fine there. Scan other hosts and networks only when they are yours or you have permission to scan them. The Nmap book has a chapter on the [legal issues](https://nmap.org/book/legal-issues.html).
 
 Scan a subnet and save the results as XML:
