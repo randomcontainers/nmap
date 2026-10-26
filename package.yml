@@ -11,11 +11,11 @@ upstream:
   # no zone, so the tarball's Last-Modified header is the release date.
   pattern: 'href="nmap-(\d+\.\d+)\.tgz"'
   versioning: loose
-  version: "7.992"
+  version: "7.993"
   artifact:
     url: https://nmap.org/dist/nmap-{version}.tgz
     signature: https://nmap.org/dist/sigs/nmap-{version}.tgz.asc
-    sha256: fb17d92dfff16c4a06b87b3d71f84058fe6a61420ba74ba5161165c8cf12af9d
+    sha256: b9477f6208cd67f6de6d0b58cecd61284947f9728b9b3d446bfa6030da088027
 image:
   entrypoint: [nmap]
   cmd: [--help]
